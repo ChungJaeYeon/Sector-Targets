@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Allocation">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Allocation Calculator</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f4f4f6; --line:#ddd; --buy:#0a7d32; --sell:#c0262d; --warn:#b26b00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111; --fg:#eee; --muted:#999; --card:#1d1d20; --line:#333; --buy:#3ccf6e; --sell:#ff6b6b; --warn:#f0a43a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:env(safe-area-inset-top) 12px 40px; background:var(--bg); color:var(--fg);
+         font:15px/1.4 -apple-system, system-ui, sans-serif; max-width:760px; margin-inline:auto; }
+  h1 { font-size:20px; margin:16px 0 8px; }
+  h2 { font-size:16px; margin:20px 0 8px; }
+  .card { background:var(--card); border-radius:10px; padding:10px; margin-bottom:8px; }
+  .row { display:flex; gap:6px; align-items:end; flex-wrap:wrap; }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); }
+  input { font:inherit; font-size:16px; /* >=16px stops iOS zoom */ padding:6px 8px; border:1px solid var(--line);
+          border-radius:6px; background:var(--bg); color:var(--fg); width:100%; }
+  .row > input { flex:1 1 90px; }
+  .row label { flex:1 1 90px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(130px, 1fr)); gap:6px; margin-top:8px; }
+  button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  button.x { padding:6px 10px; }
+  summary { cursor:pointer; margin-top:8px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { padding:6px 4px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  th { font-size:12px; color:var(--muted); font-weight:500; }
+  .buy { color:var(--buy); } .sell { color:var(--sell); } .warn { color:var(--warn); font-size:13px; }
+  .muted { color:var(--muted); font-size:13px; }
+  textarea { width:100%; min-height:100px; font:12px monospace; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+</style>
+</head>
+<body>
+<h1>Allocation Calculator</h1>
+
+<h2>Holdings</h2>
+<div id="holdings"></div>
+<div class="row">
+  <button id="addHolding">+ Holding</button>
+  <label style="flex:0 1 160px">New cash to invest <input id="cash" type="number" inputmode="decimal"></label>
+</div>
+
+<h2>Rebalance trades</h2>
+<div class="card"><table id="trades"></table><div id="tradeWarn" class="warn"></div></div>
+
+<h2>Sector exposure (look-through)</h2>
+<div class="card"><table id="sectors"></table><div id="sectorWarn" class="warn"></div></div>
+
+<h2>Sectors &amp; optional sector targets</h2>
+<div class="card">
+  <div id="sectorTargets" class="grid"></div>
+  <div class="row" style="margin-top:8px">
+    <input id="newSector" placeholder="New sector name">
+    <button id="addSector">+ Sector</button>
+  </div>
+  <div id="targetSum" class="muted"></div>
+</div>
+
+<details class="card">
+  <summary>Backup / restore (JSON)</summary>
+  <p class="muted">Data lives only in this browser. Copy it out to back up or move between devices.</p>
+  <textarea id="json"></textarea>
+  <div class="row"><button id="export">Export</button><button id="import">Import</button><button id="reset">Reset to example</button></div>
+</details>
+
+<script>
+const KEY = 'alloc-v1';
+// Example values only; real ETF sector weights come from the issuer's fact sheet.
+const EXAMPLE = {
+  sectors: ['Technology','Financials','Health Care','Consumer Disc.','Consumer Staples','Industrials',
+            'Communication','Energy','Materials','Utilities','Real Estate','Bonds','Cash'],
+  holdings: [
+    { name:'VTI',  value:10000, target:60, mix:{ Technology:33, Financials:13, 'Health Care':11, 'Consumer Disc.':10,
+      Industrials:9, Communication:9, 'Consumer Staples':5, Energy:3, Materials:2, Utilities:2.5, 'Real Estate':2.5 } },
+    { name:'BND',  value:5000,  target:30, mix:{ Bonds:100 } },
+    { name:'AAPL', value:2000,  target:10, mix:{ Technology:100 } },
+  ],
+  sectorTargets: {},
+  cash: 0,
+};
+const UNCLASSIFIED = 'Unclassified';
+
+let state = load();
+
+function load() {
+  try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && Array.isArray(s.holdings)) return s; } catch {}
+  return structuredClone(EXAMPLE);
+}
+function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
+
+const $ = id => document.getElementById(id);
+const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+const sum = a => a.reduce((x, y) => x + y, 0);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
+const money = v => Math.round(v).toLocaleString();
+const pct = v => Number.isFinite(v) ? v.toFixed(1) + '%' : '–';
+
+// Sector weights of one holding as fractions summing to 1.
+// Under 100% -> remainder is Unclassified; over 100% -> scaled down.
+function weights(h) {
+  const entries = Object.entries(h.mix).filter(([, v]) => v > 0);
+  const total = sum(entries.map(([, v]) => v));
+  const w = {};
+  const scale = total > 100 ? total : 100;
+  for (const [k, v] of entries) w[k] = v / scale;
+  if (total < 100) w[UNCLASSIFIED] = (100 - total) / 100;
+  return w;
+}
+
+function compute() {
+  const hs = state.holdings;
+  const nowTotal = sum(hs.map(h => num(h.value)));
+  const afterTotal = nowTotal + num(state.cash);
+  const targetSum = sum(hs.map(h => num(h.target)));
+
+  const trades = hs.map(h => {
+    const targetValue = afterTotal * num(h.target) / 100;
+    return { name: h.name, now: num(h.value), targetValue, trade: targetValue - num(h.value) };
+  });
+
+  const now = {}, after = {};
+  hs.forEach((h, i) => {
+    for (const [sec, w] of Object.entries(weights(h))) {
+      now[sec] = (now[sec] || 0) + num(h.value) * w;
+      after[sec] = (after[sec] || 0) + trades[i].targetValue * w;
+    }
+  });
+  // Cash not covered by holding targets (targets < 100%) stays as cash.
+  const unallocated = afterTotal - sum(trades.map(t => t.targetValue));
+  if (Math.abs(unallocated) > 0.005) after['Cash'] = (after['Cash'] || 0) + unallocated;
+
+  return { nowTotal, afterTotal, targetSum, trades, now, after };
+}
+
+function renderEditor() {
+  $('holdings').innerHTML = state.holdings.map((h, i) => `
+    <div class="card">
+      <div class="row">
+        <input data-i="${i}" data-f="name" value="${esc(h.name)}" placeholder="Ticker / name">
+        <label>Value <input type="number" inputmode="decimal" data-i="${i}" data-f="value" value="${h.value ?? ''}"></label>
+        <label>Target % <input type="number" inputmode="decimal" data-i="${i}" data-f="target" value="${h.target ?? ''}"></label>
+        <button class="x" data-del="${i}" aria-label="Remove">✕</button>
+      </div>
+      <details>
+        <summary>Sector mix <span class="muted" id="mixsum-${i}"></span></summary>
+        <div class="grid">${state.sectors.map(sec => `
+          <label>${esc(sec)} %<input type="number" inputmode="decimal" data-i="${i}" data-sec="${esc(sec)}" value="${h.mix[sec] ?? ''}"></label>`).join('')}
+        </div>
+      </details>
+    </div>`).join('');
+
+  $('sectorTargets').innerHTML = state.sectors.map(sec => `
+    <label>${esc(sec)} target %
+      <span class="row"><input type="number" inputmode="decimal" data-target="${esc(sec)}" value="${state.sectorTargets[sec] ?? ''}">
+      <button class="x" data-delsec="${esc(sec)}" aria-label="Remove sector">✕</button></span>
+    </label>`).join('');
+
+  $('cash').value = state.cash || '';
+  renderResults();
+}
+
+function renderResults() {
+  const r = compute();
+
+  state.holdings.forEach((h, i) => {
+    const s = sum(Object.values(h.mix).map(num));
+    const el = $('mixsum-' + i);
+    if (el) el.innerHTML = s === 100 ? '(100%)' : `<span class="warn">(${s}% — ${s < 100 ? 'rest counted as Unclassified' : 'scaled to 100%'})</span>`;
+  });
+
+  $('trades').innerHTML = `
+    <tr><th>Holding</th><th>Now</th><th>Now %</th><th>Target %</th><th>Buy / Sell</th></tr>
+    ${r.trades.map((t, i) => `<tr>
+      <td>${esc(t.name || '—')}</td><td>${money(t.now)}</td>
+      <td>${pct(t.now / r.nowTotal * 100)}</td><td>${pct(num(state.holdings[i].target))}</td>
+      <td class="${t.trade >= 0 ? 'buy' : 'sell'}">${Math.abs(t.trade) < 0.5 ? '—' : (t.trade > 0 ? '+' : '−') + money(Math.abs(t.trade))}</td>
+    </tr>`).join('')}
+    <tr><td><b>Total</b></td><td>${money(r.nowTotal)}</td><td></td><td>${pct(r.targetSum)}</td><td>${money(r.afterTotal)} after</td></tr>`;
+  $('tradeWarn').textContent = Math.abs(r.targetSum - 100) > 0.01
+    ? `Holding targets sum to ${r.targetSum}%; ${r.targetSum < 100 ? 'the remainder is left as Cash' : 'this over-allocates'}.` : '';
+
+  const hasTargets = Object.values(state.sectorTargets).some(v => v !== '' && v != null);
+  const secs = [...state.sectors, UNCLASSIFIED].filter((s, i, a) => a.indexOf(s) === i)
+    .filter(s => (r.now[s] || 0) > 0.005 || (r.after[s] || 0) > 0.005 || num(state.sectorTargets[s]) > 0);
+  $('sectors').innerHTML = `
+    <tr><th>Sector</th><th>Now %</th><th>After %</th>${hasTargets ? '<th>Target %</th><th>Gap</th>' : ''}</tr>
+    ${secs.map(s => {
+      const nowP = (r.now[s] || 0) / r.nowTotal * 100;
+      const afterP = (r.after[s] || 0) / r.afterTotal * 100;
+      let extra = '';
+      if (hasTargets && !(s in state.sectorTargets)) {
+        extra = '<td>–</td><td>–</td>';
+      } else if (hasTargets) {
+        const t = num(state.sectorTargets[s]);
+        const gap = r.afterTotal * t / 100 - (r.after[s] || 0);
+        extra = `<td>${pct(t)}</td><td class="${gap >= 0 ? 'buy' : 'sell'}">${Math.abs(gap) < 0.5 ? '—' : (gap > 0 ? '+' : '−') + money(Math.abs(gap))}</td>`;
+      }
+      return `<tr><td>${esc(s)}</td><td>${pct(nowP)}</td><td>${pct(afterP)}</td>${extra}</tr>`;
+    }).join('')}`;
+  $('sectorWarn').textContent = hasTargets
+    ? 'Gap = how far the post-rebalance portfolio is from your sector target. Adjust holding targets until gaps are near zero.' : '';
+
+  const ts = sum(Object.values(state.sectorTargets).map(num));
+  $('targetSum').textContent = hasTargets ? `Sector targets sum to ${ts}%.` : 'Sector targets are optional.';
+}
+
+$('holdings').addEventListener('input', e => {
+  const t = e.target, i = Number(t.dataset.i);
+  if (!Number.isInteger(i)) return;
+  const h = state.holdings[i];
+  if (t.dataset.sec !== undefined) {
+    if (t.value === '') delete h.mix[t.dataset.sec]; else h.mix[t.dataset.sec] = num(t.value);
+  } else if (t.dataset.f === 'name') h.name = t.value;
+  else h[t.dataset.f] = t.value === '' ? '' : num(t.value);
+  save(); renderResults();
+});
+$('holdings').addEventListener('click', e => {
+  const d = e.target.dataset.del;
+  if (d === undefined) return;
+  state.holdings.splice(Number(d), 1); save(); renderEditor();
+});
+$('addHolding').onclick = () => { state.holdings.push({ name:'', value:'', target:'', mix:{} }); save(); renderEditor(); };
+$('cash').oninput = e => { state.cash = num(e.target.value); save(); renderResults(); };
+
+$('sectorTargets').addEventListener('input', e => {
+  const s = e.target.dataset.target;
+  if (s === undefined) return;
+  if (e.target.value === '') delete state.sectorTargets[s]; else state.sectorTargets[s] = num(e.target.value);
+  save(); renderResults();
+});
+$('sectorTargets').addEventListener('click', e => {
+  const s = e.target.dataset.delsec;
+  if (s === undefined || !confirm(`Remove sector "${s}" from all holdings?`)) return;
+  state.sectors = state.sectors.filter(x => x !== s);
+  delete state.sectorTargets[s];
+  state.holdings.forEach(h => delete h.mix[s]);
+  save(); renderEditor();
+});
+$('addSector').onclick = () => {
+  const s = $('newSector').value.trim();
+  if (!s || s === UNCLASSIFIED || state.sectors.includes(s)) return;
+  state.sectors.push(s); $('newSector').value = ''; save(); renderEditor();
+};
+
+$('export').onclick = () => { $('json').value = JSON.stringify(state, null, 2); navigator.clipboard?.writeText($('json').value).catch(() => {}); };
+$('import').onclick = () => {
+  try {
+    const s = JSON.parse($('json').value);
+    if (!Array.isArray(s.holdings) || !Array.isArray(s.sectors)) throw new Error('missing holdings/sectors');
+    state = { sectorTargets: {}, cash: 0, ...s }; save(); renderEditor();
+  } catch (err) { alert('Invalid JSON: ' + err.message); }
+};
+$('reset').onclick = () => { if (confirm('Replace all data with the example?')) { state = structuredClone(EXAMPLE); save(); renderEditor(); } };
+
+renderEditor();
+</script>
+</body>
+</html>
